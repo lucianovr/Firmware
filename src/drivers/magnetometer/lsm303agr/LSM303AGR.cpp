@@ -39,8 +39,8 @@
 
 #include "LSM303AGR.hpp"
 
-#include <px4_config.h>
-#include <px4_defines.h>
+#include <px4_platform_common/px4_config.h>
+#include <px4_platform_common/defines.h>
 #include <ecl/geo/geo.h>
 
 /* SPI protocol address bits */
@@ -61,8 +61,10 @@ static constexpr uint8_t LSM303AGR_WHO_AM_I_M = 0x40;
  */
 #define LSM303AGR_TIMER_REDUCTION				200
 
-LSM303AGR::LSM303AGR(int bus, const char *path, uint32_t device, enum Rotation rotation) :
-	SPI("LSM303AGR", path, bus, device, SPIDEV_MODE3, 8 * 1000 * 1000),
+LSM303AGR::LSM303AGR(I2CSPIBusOption bus_option, int bus, int device, enum Rotation rotation, int bus_frequency,
+		     spi_mode_e spi_mode) :
+	SPI("LSM303AGR", nullptr, bus, device, spi_mode, bus_frequency),
+	I2CSPIDriver(MODULE_NAME, px4::device_bus_to_wq(get_device_id()), bus_option, bus),
 	_mag_sample_perf(perf_alloc(PC_ELAPSED, "LSM303AGR_mag_read")),
 	_bad_registers(perf_alloc(PC_COUNT, "LSM303AGR_bad_reg")),
 	_bad_values(perf_alloc(PC_COUNT, "LSM303AGR_bad_val")),
@@ -82,9 +84,6 @@ LSM303AGR::LSM303AGR(int bus, const char *path, uint32_t device, enum Rotation r
 
 LSM303AGR::~LSM303AGR()
 {
-	/* make sure we are truly inactive */
-	stop();
-
 	if (_class_instance != -1) {
 		unregister_class_devname(MAG_BASE_DEVICE_PATH, _class_instance);
 	}
@@ -98,12 +97,12 @@ LSM303AGR::~LSM303AGR()
 int
 LSM303AGR::init()
 {
-	int ret = PX4_OK;
-
 	/* do SPI init (and probe) first */
-	if (SPI::init() != OK) {
-		PX4_ERR("SPI init failed");
-		return PX4_ERROR;
+	int ret = SPI::init();
+
+	if (ret != OK) {
+		DEVICE_DEBUG("SPI init failed (%i)", ret);
+		return ret;
 	}
 
 	_class_instance = register_class_devname(MAG_BASE_DEVICE_PATH);
@@ -116,6 +115,9 @@ LSM303AGR::init()
 
 	/* fill report structures */
 	measure();
+
+	_measure_interval = CONVERSION_INTERVAL;
+	start();
 
 	return ret;
 }
@@ -252,10 +254,10 @@ LSM303AGR::ioctl(struct file *filp, int cmd, unsigned long arg)
 			/* set default polling rate */
 			case SENSOR_POLLRATE_DEFAULT: {
 					/* do we need to start internal polling? */
-					bool want_start = (_measure_ticks == 0);
+					bool want_start = (_measure_interval == 0);
 
 					/* set interval for next measurement to minimum legal value */
-					_measure_ticks = USEC2TICK(CONVERSION_INTERVAL);
+					_measure_interval = (CONVERSION_INTERVAL);
 
 					/* if we need to start the poll state machine, do it */
 					if (want_start) {
@@ -268,18 +270,18 @@ LSM303AGR::ioctl(struct file *filp, int cmd, unsigned long arg)
 			/* adjust to a legal polling interval in Hz */
 			default: {
 					/* do we need to start internal polling? */
-					bool want_start = (_measure_ticks == 0);
+					bool want_start = (_measure_interval == 0);
 
 					/* convert hz to tick interval via microseconds */
-					unsigned ticks = USEC2TICK(1000000 / arg);
+					unsigned interval = (1000000 / arg);
 
 					/* check against maximum rate */
-					if (ticks < USEC2TICK(CONVERSION_INTERVAL)) {
+					if (interval < CONVERSION_INTERVAL) {
 						return -EINVAL;
 					}
 
 					/* update interval for next measurement */
-					_measure_ticks = ticks;
+					_measure_interval = interval;
 
 					/* if we need to start the poll state machine, do it */
 					if (want_start) {
@@ -345,31 +347,13 @@ LSM303AGR::start()
 	_collect_phase = false;
 
 	/* schedule a cycle to start things */
-	work_queue(HPWORK, &_work, (worker_t)&LSM303AGR::cycle_trampoline, this, 1);
+	ScheduleNow();
 }
 
 void
-LSM303AGR::stop()
+LSM303AGR::RunImpl()
 {
-	if (_measure_ticks > 0) {
-		/* ensure no new items are queued while we cancel this one */
-		_measure_ticks = 0;
-		work_cancel(HPWORK, &_work);
-	}
-}
-
-void
-LSM303AGR::cycle_trampoline(void *arg)
-{
-	LSM303AGR *dev = (LSM303AGR *)arg;
-
-	dev->cycle();
-}
-
-void
-LSM303AGR::cycle()
-{
-	if (_measure_ticks == 0) {
+	if (_measure_interval == 0) {
 		return;
 	}
 
@@ -390,14 +374,10 @@ LSM303AGR::cycle()
 		/*
 		 * Is there a collect->measure gap?
 		 */
-		if (_measure_ticks > USEC2TICK(CONVERSION_INTERVAL)) {
+		if (_measure_interval > CONVERSION_INTERVAL) {
 
 			/* schedule a fresh cycle call when we are ready to measure again */
-			work_queue(HPWORK,
-				   &_work,
-				   (worker_t)&LSM303AGR::cycle_trampoline,
-				   this,
-				   _measure_ticks - USEC2TICK(CONVERSION_INTERVAL));
+			ScheduleDelayed(_measure_interval - CONVERSION_INTERVAL);
 
 			return;
 		}
@@ -409,9 +389,9 @@ LSM303AGR::cycle()
 	/* next phase is collection */
 	_collect_phase = true;
 
-	if (_measure_ticks > 0) {
+	if (_measure_interval > 0) {
 		/* schedule a fresh cycle call when the measurement is done */
-		work_queue(HPWORK,  &_work, (worker_t)&LSM303AGR::cycle_trampoline, this, USEC2TICK(CONVERSION_INTERVAL));
+		ScheduleDelayed(CONVERSION_INTERVAL);
 	}
 }
 
@@ -434,7 +414,7 @@ LSM303AGR::collect()
 		/* start the performance counter */
 		perf_begin(_mag_sample_perf);
 
-		mag_report mag_report = {};
+		sensor_mag_s mag_report = {};
 		mag_report.timestamp = hrt_absolute_time();
 
 		// switch to right hand coordinate system in place
@@ -487,8 +467,9 @@ LSM303AGR::collect()
 }
 
 void
-LSM303AGR::print_info()
+LSM303AGR::print_status()
 {
+	I2CSPIDriverBase::print_status();
 	perf_print_counter(_mag_sample_perf);
 	perf_print_counter(_bad_registers);
 	perf_print_counter(_bad_values);
